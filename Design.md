@@ -1,1 +1,623 @@
 
+# StockRoom — System Design Document
+
+**Project:** StockRoom (Phase 1 — Inventory Core)
+**Client:** Kashvi Apparel Retail, Indore
+**Document Status:** Draft for Day 7 Review & Written Approval
+**Version:** 1.0
+**Target Delivery:** 25 December 2026
+**Tech Stack:** React 18, TypeScript, Node.js 22, PostgreSQL, Prisma, Redis, BullMQ, Socket.io, Docker, GitHub Actions, Render
+
+---
+
+## 1. Main Database Tables (Quick Overview)
+
+1. **companies** — Tenant root storing each retail client (e.g., Kashvi Apparel Retail) so all data stays strictly isolated per company.
+2. **sites** — Physical stores and warehouses owned by a company (e.g., Indore Godown, MG Road Store, Palasia Store).
+3. **locations** — Named areas inside a site (e.g., Shop Floor, Backroom, Hold Rack).
+4. **staff** — Authorized employee login accounts, company membership, system roles, and assigned site permissions.
+5. **items** — Parent clothing styles, fixed supplier size-ratio templates, and Style + Colour + Size variants (`item_variants`).
+6. **movements** — Append-only, uneditable stock ledger recording every stock delta; all stock balances are calculated from this table.
+
+Supporting operational tables (`purchase_orders`, `transfers`, `stock_counts`, `import_jobs`, `import_rows`) connect business documents to the immutable `movements` ledger.
+
+---
+
+## 2. Project Overview: Why & What We Are Developing
+
+### 2.1 Why We Are Building StockRoom (The Problem)
+Kashvi Apparel Retail operates multiple retail stores and a central godown in Indore. Managing clothing inventory manually or by directly editing stock numbers causes:
+- **Unexplained Stock Mismatches:** Overwriting stock quantities leaves no record of who changed a number, when it changed, or why.
+- **Lost Visibility Across Garment States:** Pieces reserved for customers (`ON_HOLD`) or sent out for alteration (`AT_TAILOR`) accidentally get promised for store transfers or sales.
+- **Size & Bundle Confusion:** Apparel arrives in fixed size-ratio sets (pre-packs) and mixes letter sizes (`S`–`XL`), numeric sizes (`38`–`44`), and free-size labels (`Free`, `F/S`, `Free Size`).
+- **Error-Prone Data Onboarding:** Importing initial store and godown spreadsheets manually risks duplicate rows and lost audit trails.
+
+### 2.2 What We Are Developing (The Solution)
+StockRoom v1.0.0 is a multi-tenant, real-time inventory core built around five engineering pillars:
+1. **Strict Company & Site Isolation:** Every database table and API query is scoped to `company_id`, ensuring zero data leakage across tenants and site-level access control for branch staff.
+2. **3-Level Apparel Variant Tracking:** Every physical garment is tracked at **Style + Colour + Size**, preserving numeric (`38`–`44`) and letter (`S`–`XL`) sizes separately while normalizing `Free` / `F/S` / `Free Size`.
+3. **Append-Only Movement Ledger:** Stock on hand is never overwritten. Every operational action writes a permanent movement row (`actor_id`, `timestamp`, `bucket`, `quantity`), and current stock is derived by summing those rows.
+4. **Controlled Operational Flows:** Enforces PO over-receipt rejection, two-step inter-site transfers (`DISPATCHED` -> `RECEIVED`), isolated `ON_HOLD` / `AT_TAILOR` buckets, and manager-approved stock counts.
+5. **Idempotent Background Importer & Live UI:** Processes client spreadsheets asynchronously via Redis/BullMQ with a row-by-row report and pushes live stock updates to screens via Socket.io.
+
+### 2.3 Confirmed Client Rules vs. Open Questions
+- **Confirmed Rules (Built into Design):**
+  - `ON_HOLD` and `AT_TAILOR` stock cannot be sold or transferred, and stays locked until manually released (no automatic hold expiry).
+  - A tailor is a status/reference (`tailor_name`), not a site; the dashboard displays how many pieces each tailor holds.
+  - Sending store manager must dispatch transfers on the system before goods physically leave.
+  - Numeric sizes (`38`–`44`) and letter sizes (`S`–`XL`) must not merge; `Free`, `F/S`, and `Free Size` normalize to `Free Size`.
+  - Opening stock balances must be traceable in the ledger with who loaded them, when, and checked against the source file cut-off date.
+- **Open Questions (Awaiting Written Client Confirmation — Not Assumed):**
+  - Extra fields required on Hold/Tailor records (e.g., customer phone, expected tailor return date).
+  - Exact count procedure and adjustment rules for `ON_HOLD` and `AT_TAILOR` units.
+  - How transfer shortfalls (received < dispatched) should be handled.
+  - Incomplete supplier size-ratio set handling and additional file auto-correct vs. reject rules.
+
+---
+
+## 3. System Architecture & End-to-End Flow
+
+### 3.1 High-Level Architecture Diagram
+
+```mermaid
+flowchart TB
+    subgraph Client["Client Layer (React 18 + TypeScript)"]
+        WebApp[StockRoom Web UI]
+        SocketClient[Socket.io Live Listener]
+    end
+
+    subgraph Server["Application Layer (Node.js 22)"]
+        AuthGuard[JWT & Company/Site Scope Middleware]
+        RestAPI[REST API Controllers]
+        LedgerEngine[Transactional Ledger Engine]
+        SocketServer[Socket.io Room Broadcaster]
+    end
+
+    subgraph Async["Background Queue (Redis + BullMQ)"]
+        RedisQueue[(Redis Queue)]
+        ImportWorker[CSV/XLSX Import Worker]
+    end
+
+    subgraph Database["Persistence Layer (PostgreSQL + Prisma)"]
+        Postgres[(PostgreSQL
+Composite FKs + Immutability Trigger)]
+    end
+
+    WebApp -->|HTTPS REST / File Upload| AuthGuard
+    AuthGuard --> RestAPI
+    RestAPI --> LedgerEngine
+    RestAPI -->|Enqueue Import Job| RedisQueue
+    RedisQueue --> ImportWorker
+    ImportWorker --> LedgerEngine
+    LedgerEngine -->|ACID Tx + Advisory Lock| Postgres
+    LedgerEngine -.->|Post-Commit Event| SocketServer
+    SocketServer -.->|Live Update < 1s| SocketClient
+```
+
+### 3.2 End-to-End Business Process Flow
+
+```mermaid
+flowchart TD
+    Start([Client Data File / Daily Operation]) --> Choice{Operation Type}
+
+    Choice -->|Initial Onboarding| Imp1[Admin Uploads CSV/XLSX]
+    Imp1 --> Imp2[BullMQ Worker Validates & Normalizes]
+    Imp2 --> Imp3[Write OPENING_STOCK to Ledger + Row Report]
+
+    Choice -->|Vendor Delivery| PO1[Staff Enters PO Receipt / Size Sets]
+    PO1 --> PO2{Received <= Ordered?}
+    PO2 -->|No| POErr[API Rejects Over-Receipt]
+    PO2 -->|Yes| PO3[Write PO_RECEIPT +N to AVAILABLE]
+
+    Choice -->|Branch Transfer| Tr1[Step 1: Manager Dispatches Transfer]
+    Tr1 --> Tr2[-N Source AVAILABLE / +N Dest IN_TRANSIT]
+    Tr2 --> Tr3[Step 2: Destination Confirms Receipt]
+    Tr3 --> Tr4[-N Dest IN_TRANSIT / +N Dest AVAILABLE]
+
+    Choice -->|Customer Hold / Tailor| Ht1[Move AVAILABLE -> ON_HOLD or AT_TAILOR]
+    Ht1 --> Ht2[Blocked from Sale & Transfer Until Released]
+
+    Choice -->|Physical Audit| Cnt1[Staff/Auditor Submits Physical Count]
+    Cnt1 --> Cnt2{Variance == 0?}
+    Cnt2 -->|No| Cnt3[Manager Approves Variance]
+    Cnt3 --> Cnt4[Write COUNT_ADJUSTMENT to Ledger]
+
+    Imp3 & PO3 & Tr4 & Ht1 & Cnt4 --> Ledger[(Immutable Movements Ledger)]
+    Ledger --> LiveUI[Recalculate Balances & Push Socket.io Update]
+```
+
+---
+
+## 4. Module-Wise Step-by-Step Process & Examples
+
+### Module 1: Organisation, Login & Role-Based Access
+
+#### Step-by-Step Flow
+1. **Company & Site Setup:** Company Admin creates `Kashvi Apparel Retail` (`code: KASHVI`), adds Indore sites (`Indore Godown`, `MG Road Store`, `Palasia Store`), and defines internal locations (`Main Rack`, `Hold Shelf`).
+2. **Staff Assignment:** Admin creates employee accounts, assigns a role (`ADMIN`, `STORE_MANAGER`, `WAREHOUSE_STAFF`, `AUDITOR`), and links non-admin staff to specific sites via `staff_sites`.
+3. **Authenticated Request Scoping:** When a user logs in, the server issues a signed token containing `staff_id`, `company_id`, `role`, and `assigned_site_ids`. Every API query automatically filters by `company_id` and validates site membership.
+
+#### Role Permissions Summary
+
+| Role | Site Access | Allowed Actions | Restricted Actions |
+| :--- | :--- | :--- | :--- |
+| **Company Admin** | All Company Sites | Manage sites, locations, staff, items, size ratios; upload client files; approve counts; full ledger view | Cannot access another company |
+| **Store / Warehouse Manager** | Assigned Sites | Approve/reject stock counts; dispatch/receive transfers; receive POs; manage holds/tailor | Cannot access unassigned sites or other companies |
+| **Store / Warehouse Staff** | Assigned Site | Receive POs; confirm transfer receipts; place/release holds & tailor items; submit stock counts | Cannot approve own stock counts |
+| **Inventory Auditor** | Audit Scope Sites | Perform physical stock counts; inspect immutable ledger & audit trails | Cannot receive POs, transfer stock, or approve counts |
+
+---
+
+### Module 2: Item Master & Size Normalization
+
+#### Step-by-Step Flow
+1. **Create Parent Style:** Admin defines `style_code` (unique per company) and optional `set_ratio` template (e.g., `{"S": 1, "M": 2, "L": 2, "XL": 1}`).
+2. **Create Variants:** System creates unique `sku_code` records for each `Style + Colour + Size` combination.
+3. **Enforce Size Rules:**
+   - Numeric sizes (`38`, `40`, `42`, `44`) remain distinct from letter sizes (`S`, `M`, `L`, `XL`).
+   - Free size aliases (`"Free"`, `"F/S"`, `"Free Size"`) normalize automatically to `"Free Size"`.
+
+#### Concrete Example
+- **Parent Style:** `KSH-KUR-101` — *Anarkali Cotton Kurti* (`set_ratio`: `1S : 2M : 2L : 1XL` = 6 pieces per set)
+- **Generated Variants:**
+  - `KSH-KUR-101-RED-S` (Colour: `Red`, Size: `S`)
+  - `KSH-KUR-101-RED-M` (Colour: `Red`, Size: `M`)
+  - `KSH-SET-205-BLU-40` (Colour: `Blue`, Size: `40` — kept separate from `M`/`L`)
+  - `KSH-DUP-301-GLD-Free Size` (Normalized from `"F/S"`)
+
+---
+
+### Module 3: Immutable Stock Movement Ledger (Core Engine)
+
+#### Step-by-Step Flow
+1. **Receive Business Command:** API receives an action (e.g., PO receipt, transfer dispatch) and starts a PostgreSQL ACID transaction.
+2. **Acquire Row/Advisory Lock:** Acquires a transaction lock on `(company_id, site_id, variant_id, bucket)` so parallel requests cannot race.
+3. **Validate Balance:** Sums existing `movements.quantity` for that key. If an outbound action would drop `AVAILABLE` below `0`, the transaction aborts.
+4. **Insert Paired Movements:** Inserts immutable ledger row(s) with server-generated `created_at` and `actor_id`.
+5. **Emit Real-Time Event:** After commit, broadcasts updated stock totals via Socket.io to the company/site room.
+
+#### Balance Derivation Formula
+```sql
+SELECT company_id, site_id, variant_id, bucket, SUM(quantity) AS stock_on_hand
+FROM movements
+WHERE company_id = :companyId AND site_id = :siteId
+GROUP BY company_id, site_id, variant_id, bucket;
+```
+
+---
+
+### Module 4: Background Client Data Importer (BullMQ)
+
+#### Step-by-Step Flow
+1. **Upload:** Admin uploads Kashvi Apparel's opening stock CSV/Excel file with the verified `cut_off_date`.
+2. **Queue Job:** API stores `import_jobs` metadata (`file_hash`) and enqueues a job in Redis/BullMQ.
+3. **Row-by-Row Processing:**
+   - Computes `row_hash = SHA256(company_id + cut_off_date + row_number + canonical_values)`.
+   - If `row_hash` already exists in `movements`, marks row `SKIPPED` (ensuring running the file twice yields identical stock).
+   - Cleans whitespace and normalizes `"Free"` / `"F/S"` -> `"Free Size"`, marking row `CORRECTED`.
+   - Rejects invalid quantities or unknown sites with clear error reasons, marking row `ERROR`.
+   - Posts `+N` (`OPENING_STOCK`) into `AVAILABLE` for valid rows, marking row `LOADED`.
+
+#### Example Row-by-Row Report
+
+| Row | Raw Spreadsheet Data | Action Taken | Status | Report Message |
+| :---: | :--- | :--- | :--- | :--- |
+| **1** | `Indore Godown, KSH-KUR-101, Red, M, 50` | Posted `+50` `OPENING_STOCK` | `LOADED` | Loaded 50 units into Indore Godown. |
+| **2** | `MG Road Store, KSH-DUP-301, Gold, F/S, 20` | Normalized `"F/S"` -> `"Free Size"`, posted `+20` | `CORRECTED` | Normalized size F/S to Free Size and loaded 20 units. |
+| **3** | `Indore Godown, KSH-KUR-101, Red, M, 50` | Matching `row_hash` found | `SKIPPED` | Duplicate row skipped; opening stock unchanged. |
+| **4** | `Palasia Store, KSH-KUR-101, Blue, 42, -4` | Rejected negative quantity | `ERROR` | Left out: Opening stock quantity cannot be negative. |
+
+---
+
+### Module 5: Purchase Order (PO) & Partial Receiving
+
+#### Step-by-Step Flow
+1. **Create PO:** Manager creates `PO-101` for `Indore Godown` ordering `10 Sets` (`60 units` total) of `KSH-KUR-101` (`Red`).
+2. **Partial Delivery (Day 1):** Vendor delivers `6 Sets`. Staff enters `sets_received = 6`. System multiplies by `set_ratio` (`6S, 12M, 12L, 6XL` = `36 units`), confirms `36 <= 60`, and posts `PO_RECEIPT` movements to `AVAILABLE`.
+3. **Over-Receipt Block (Day 2):** Vendor sends `5 Sets` (`30 units`). System calculates `36 + 30 = 66 > 60` and rejects the request (`400 Bad Request`: *"Exceeds remaining PO balance of 24 units"*).
+
+---
+
+### Module 6: Two-Step Inter-Site Transfers (with Sequence Diagram)
+
+#### Step-by-Step Flow
+1. **Create Draft:** Manager creates transfer `TRF-01` to move `10 units` of `KSH-KUR-101-RED-M` from `Indore Godown` to `MG Road Store`.
+2. **Step 1 — Dispatch:** Sending manager clicks **Dispatch** before goods leave the godown. Ledger posts `-10` from `Indore Godown (AVAILABLE)` and `+10` to `MG Road Store (IN_TRANSIT)`.
+3. **Step 2 — Receive:** When garments arrive at MG Road Store, receiving staff clicks **Confirm Receipt**. Ledger posts `-10` from `MG Road Store (IN_TRANSIT)` and `+10` to `MG Road Store (AVAILABLE)`.
+4. **Illegal Step Protection:** Attempting to receive a `DRAFT` transfer or confirming receipt twice is rejected by the API.
+
+#### Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Mgr as Sending Manager (Godown)
+    participant API as StockRoom API
+    participant DB as PostgreSQL Ledger
+    participant WS as Socket.io
+    actor Staff as Receiving Staff (MG Road)
+
+    Mgr->>API: POST /transfers/TRF-01/dispatch
+    API->>DB: BEGIN TX + Lock (Godown, Variant, AVAILABLE)
+    DB-->>API: Check AVAILABLE >= 10 (Excludes ON_HOLD / AT_TAILOR)
+    API->>DB: INSERT -10 (Godown, AVAILABLE) & +10 (MG Road, IN_TRANSIT)
+    API->>DB: UPDATE status = DISPATCHED + COMMIT
+    API-->>WS: Emit stock:updated (Godown & MG Road)
+
+    Staff->>API: POST /transfers/TRF-01/receive
+    API->>DB: BEGIN TX + Verify status == DISPATCHED
+    API->>DB: INSERT -10 (MG Road, IN_TRANSIT) & +10 (MG Road, AVAILABLE)
+    API->>DB: UPDATE status = RECEIVED + COMMIT
+    API-->>WS: Emit stock:updated (MG Road)
+```
+
+---
+
+### Module 7: On Hold & At Tailor Tracking
+
+#### Step-by-Step Flow
+1. **Place On Hold / Send to Tailor:** Store staff selects `2 units` of `KSH-KUR-101-RED-M` at `MG Road Store` and marks them `AT_TAILOR` with `tailor_name = "Ramesh Master"`.
+2. **Bucket Shift:** Ledger posts `-2` from `AVAILABLE` and `+2` to `AT_TAILOR`.
+3. **Transfer & Sale Block:** If `MG Road Store` has `10` total pieces (`8 AVAILABLE`, `2 AT_TAILOR`) and someone tries to transfer `9` pieces, the API rejects it because only `8 AVAILABLE` pieces exist.
+4. **Tailor-Wise Visibility & Return:** Dashboard groups `AT_TAILOR` movements by `tailor_name` to display `"Ramesh Master: 2 pcs"`. When returned, staff records `TAILOR_IN` (`-2 AT_TAILOR`, `+2 AVAILABLE`).
+
+---
+
+### Module 8: Stock Counts & Manager Approval
+
+#### Step-by-Step Flow
+1. **Record Count:** Store staff or auditor counts physical racks at `Palasia Store`. System shows `20 AVAILABLE` units; staff counts `18` (`variance = -2`). Note: `ON_HOLD` and `AT_TAILOR` units are kept separate from free `AVAILABLE` stock.
+2. **Submit Count:** Staff submits count (`status: SUBMITTED`). **Stock balances do not change yet.**
+3. **Manager Approval:** Store Manager reviews the `-2` variance and clicks **Approve**. System inserts a `COUNT_ADJUSTMENT` movement of `-2` into `AVAILABLE` with `actor_id = manager.id`.
+
+---
+
+## 5. Complete Database Schema (Prisma & SQL Guards)
+
+### 5.1 Entity-Relationship (ER) Diagram
+
+```mermaid
+erDiagram
+    COMPANIES ||--o{ SITES : owns
+    COMPANIES ||--o{ STAFF : employs
+    COMPANIES ||--o{ ITEMS : defines
+    COMPANIES ||--o{ MOVEMENTS : scopes
+
+    SITES ||--o{ LOCATIONS : contains
+    SITES ||--o{ STAFF_SITES : assigned_to
+    STAFF ||--o{ STAFF_SITES : has_access
+    SITES ||--o{ MOVEMENTS : tracks_stock_at
+
+    ITEMS ||--o{ ITEM_VARIANTS : has_skus
+    ITEMS ||--o{ SIZE_RATIO_TEMPLATES : defines_sets
+    ITEM_VARIANTS ||--o{ MOVEMENTS : moved_in
+    STAFF ||--o{ MOVEMENTS : records_as_actor
+
+    COMPANIES {
+        uuid id PK
+        string name
+        string code UK
+    }
+    SITES {
+        uuid id PK
+        uuid company_id FK
+        string name
+        string type
+    }
+    LOCATIONS {
+        uuid id PK
+        uuid company_id FK
+        uuid site_id FK
+        string name
+    }
+    STAFF {
+        uuid id PK
+        uuid company_id FK
+        string email
+        string role
+        boolean is_active
+    }
+    ITEMS {
+        uuid id PK
+        uuid company_id FK
+        string style_code
+        string name
+    }
+    ITEM_VARIANTS {
+        uuid id PK
+        uuid company_id FK
+        uuid item_id FK
+        string sku_code
+        string colour
+        string size
+    }
+    MOVEMENTS {
+        uuid id PK
+        uuid company_id FK
+        uuid site_id FK
+        uuid variant_id FK
+        uuid actor_id FK
+        string movement_type
+        string bucket
+        int quantity
+        string reference_type
+        string reference_id
+        string tailor_name
+        timestamp created_at
+    }
+```
+
+### 5.2 Prisma Schema (`prisma/schema.prisma`)
+
+```prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum StaffRole {
+  ADMIN
+  STORE_MANAGER
+  WAREHOUSE_STAFF
+  AUDITOR
+}
+
+enum StockBucket {
+  AVAILABLE
+  IN_TRANSIT
+  ON_HOLD
+  AT_TAILOR
+}
+
+enum MovementType {
+  OPENING_STOCK
+  PO_RECEIPT
+  TRANSFER_DISPATCH
+  TRANSFER_RECEIVE
+  COUNT_ADJUSTMENT
+  HOLD_LOCK
+  HOLD_RELEASE
+  TAILOR_OUT
+  TAILOR_IN
+}
+
+model Company {
+  id        String   @id @default(uuid())
+  name      String
+  code      String   @unique
+  createdAt DateTime @default(now())
+
+  sites     Site[]
+  staff     Staff[]
+  items     Item[]
+  movements Movement[]
+}
+
+model Site {
+  id        String   @id @default(uuid())
+  companyId String
+  name      String
+  type      String
+  createdAt DateTime @default(now())
+
+  company   Company     @relation(fields: [companyId], references: [id])
+  locations Location[]
+  staff     StaffSite[]
+  movements Movement[]
+
+  @@unique([companyId, id])
+  @@unique([companyId, name])
+  @@index([companyId])
+}
+
+model Location {
+  id        String   @id @default(uuid())
+  companyId String
+  siteId    String
+  name      String
+  createdAt DateTime @default(now())
+
+  site      Site       @relation(fields: [companyId, siteId], references: [companyId, id])
+  movements Movement[]
+
+  @@unique([siteId, name])
+  @@index([companyId])
+}
+
+model Staff {
+  id           String      @id @default(uuid())
+  companyId    String
+  name         String
+  email        String
+  passwordHash String
+  role         StaffRole
+  isActive     Boolean     @default(true)
+  createdAt    DateTime    @default(now())
+
+  company      Company     @relation(fields: [companyId], references: [id])
+  sites        StaffSite[]
+  movements    Movement[]
+
+  @@unique([companyId, id])
+  @@unique([companyId, email])
+  @@index([companyId])
+}
+
+model StaffSite {
+  companyId String
+  staffId   String
+  siteId    String
+
+  staff Staff @relation(fields: [companyId, staffId], references: [companyId, id])
+  site  Site  @relation(fields: [companyId, siteId], references: [companyId, id])
+
+  @@id([staffId, siteId])
+  @@index([companyId])
+}
+
+model Item {
+  id        String              @id @default(uuid())
+  companyId String
+  styleCode String
+  name      String
+  createdAt DateTime            @default(now())
+
+  company   Company             @relation(fields: [companyId], references: [id])
+  variants  ItemVariant[]
+  ratios    SizeRatioTemplate[]
+
+  @@unique([companyId, id])
+  @@unique([companyId, styleCode])
+  @@index([companyId])
+}
+
+model SizeRatioTemplate {
+  id        String   @id @default(uuid())
+  companyId String
+  itemId    String
+  name      String
+  ratioJson Json
+  createdAt DateTime @default(now())
+
+  item Item @relation(fields: [companyId, itemId], references: [companyId, id])
+
+  @@unique([itemId, name])
+  @@index([companyId])
+}
+
+model ItemVariant {
+  id        String     @id @default(uuid())
+  companyId String
+  itemId    String
+  skuCode   String
+  colour    String
+  size      String
+  createdAt DateTime   @default(now())
+
+  item      Item       @relation(fields: [companyId, itemId], references: [companyId, id])
+  movements Movement[]
+
+  @@unique([companyId, id])
+  @@unique([companyId, skuCode])
+  @@unique([companyId, itemId, colour, size])
+  @@index([companyId])
+}
+
+model Movement {
+  id            String       @id @default(uuid())
+  companyId     String
+  siteId        String
+  locationId    String?
+  variantId     String
+  actorId       String
+  movementType  MovementType
+  bucket        StockBucket
+  quantity      Int
+  referenceType String?
+  referenceId   String?
+  tailorName    String?
+  notes         String?
+  createdAt     DateTime     @default(now())
+
+  company  Company     @relation(fields: [companyId], references: [id])
+  site     Site        @relation(fields: [companyId, siteId], references: [companyId, id])
+  location Location?   @relation(fields: [locationId], references: [id])
+  variant  ItemVariant @relation(fields: [companyId, variantId], references: [companyId, id])
+  actor    Staff       @relation(fields: [companyId, actorId], references: [companyId, id])
+
+  @@index([companyId, siteId, variantId, bucket])
+  @@index([companyId, referenceType, referenceId])
+}
+```
+
+### 5.3 PostgreSQL Immutability Trigger
+
+```sql
+CREATE OR REPLACE FUNCTION prevent_movement_mutation()
+RETURNS trigger AS $$
+BEGIN
+  RAISE EXCEPTION 'Movement ledger rows are strictly append-only and immutable';
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER movements_no_update_or_delete
+BEFORE UPDATE OR DELETE ON "Movement"
+FOR EACH ROW EXECUTE FUNCTION prevent_movement_mutation();
+```
+
+---
+
+## 6. Repository Structure
+
+```text
+stockroom/
+├── .github/
+│   └── workflows/
+│       └── ci.yml                  # Automated lint, unit, tenant-isolation & concurrency tests
+├── docs/
+│   └── DESIGN.md                   # This System Design Document (Day 7 deliverable)
+├── backend/
+│   ├── prisma/
+│   │   ├── schema.prisma           # Company-scoped database schema
+│   │   └── migrations/             # SQL migrations including immutability trigger
+│   ├── src/
+│   │   ├── middleware/             # JWT auth, company_id scoping, site-role guards
+│   │   ├── modules/
+│   │   │   ├── org/                # Companies, sites, locations, staff
+│   │   │   ├── items/              # Styles, variants, size normalization, set ratios
+│   │   │   ├── ledger/             # Append-only movement engine & advisory locks
+│   │   │   ├── receiving/          # Purchase orders & partial/set receipts
+│   │   │   ├── transfers/          # Two-step dispatch & receive flows
+│   │   │   ├── holds-tailor/       # ON_HOLD & AT_TAILOR bucket transitions
+│   │   │   ├── counts/             # Physical counts & manager approvals
+│   │   │   └── imports/            # BullMQ background CSV/XLSX worker & report API
+│   │   ├── sockets/                # Company/site-scoped Socket.io event emitters
+│   │   └── server.ts
+│   └── tests/
+│       ├── tenant-isolation.test.ts
+│       ├── concurrency-50.test.ts
+│       └── import-idempotency.test.ts
+├── frontend/
+│   ├── src/
+│   │   ├── pages/                  # Dashboard, Ledger, POs, Transfers, Counts, Imports
+│   │   └── hooks/                  # Socket.io real-time stock subscription hooks
+│   └── package.json
+└── docker-compose.yml              # PostgreSQL 16 + Redis 7 + Backend + Frontend
+```
+
+---
+
+## 7. Non-Functional Requirements & Acceptance Criteria
+
+| Requirement | Technical Implementation | Acceptance Test |
+| :--- | :--- | :--- |
+| **Tenant Isolation** | Composite FKs `(company_id, id)` + mandatory middleware `company_id` filter | User of Company A cannot read or mutate Company B stock (`404 Not Found`) |
+| **50 Parallel Entries** | PostgreSQL ACID transaction + `pg_advisory_xact_lock` per `(company, site, variant, bucket)` | 50 parallel requests on one SKU yield exact `SUM(movements)` and zero negative stock |
+| **Idempotent File Load** | SHA-256 `row_hash` deduplication in `import_rows` & `movements.reference_id` | Uploading Kashvi Apparel's file twice produces identical totals and full row report |
+| **Ledger Immutability** | Append-only repository + DB `INSERT`-only grant + `BEFORE UPDATE OR DELETE` trigger | Direct SQL `UPDATE` or `DELETE` on `Movement` fails with exception |
+| **Real-Time UI (< 1s)** | Post-commit Socket.io broadcast to `company:{id}:site:{id}` room | Open dashboards update stock counts automatically without browser refresh |
+
+---
+
+## 8. Day 7 Review & Approval Checklist
+
+| Check | Evidence Location | Status |
+| :--- | :--- | :--- |
+| Main tables (`companies`, `sites`, `locations`, `staff`, `items`, `movements`) listed | Section 1 & Section 5 | Drafted |
+| Company-scoped schema & composite FK rules documented | Section 5.2 | Drafted |
+| Append-only movement ledger & SQL immutability controls documented | Section 4 (Module 3) & Section 5.3 | Drafted |
+| Roles, login access & permissions matrix documented | Section 4 (Module 1) | Drafted |
+| Confirmed Kashvi Apparel business rules separated from open questions | Section 2.3 | Drafted |
+| Shared with mentor / client in Team Workspace | Link/commit posted in Team Workspace | Pending |
+| Explicit written approval confirmed in Team Workspace | Written reply recorded below | Pending |
+
+### Approval Sign-Off Record
+- **Reviewer (Mentor / Client):** ______________________________
+- **Team Workspace Thread Link:** ______________________________
+- **Decision:** Pending / Approved / Changes Requested
+- **Approval Date & Time:** ______________________________
+- **Approved Commit / Version:** `v1.0` / `_________________`
